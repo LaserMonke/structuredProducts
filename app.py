@@ -22,15 +22,129 @@ GRAY = "#8a8a85"
 
 st.markdown("""
 <style>
-  .block-container {padding-top: 2.2rem; max-width: 1250px;}
-  div[data-testid="stMetric"] {background: #f7f6f2; border: 1px solid #e5e3da;
-    border-radius: 10px; padding: 14px 18px;}
-  h1 {font-weight: 600;}
-  .note-box {background:#f2f5f9; border-left:4px solid #2a5d8f; padding:12px 16px;
-    border-radius:0 8px 8px 0; font-size:0.92rem; margin: 6px 0 14px 0;}
-  .warn-box {background:#faf3ee; border-left:4px solid #c0392b; padding:12px 16px;
-    border-radius:0 8px 8px 0; font-size:0.92rem; margin: 6px 0 14px 0;}
-</style>""", unsafe_allow_html=True)
+
+/* ---------- Main Layout ---------- */
+
+.block-container{
+    max-width:1280px;
+    padding-top:2rem;
+    padding-bottom:2rem;
+}
+
+/* ---------- Metric Cards ---------- */
+
+div[data-testid="stMetric"]{
+    background:rgba(127,127,127,0.10);
+    backdrop-filter:blur(12px);
+    border:1px solid rgba(127,127,127,0.25);
+    border-radius:14px;
+    padding:18px;
+    box-shadow:0 2px 8px rgba(0,0,0,.18);
+}
+
+div[data-testid="stMetricLabel"]{
+    font-size:0.95rem;
+    font-weight:600;
+}
+
+div[data-testid="stMetricValue"]{
+    font-size:2rem;
+    font-weight:700;
+}
+
+div[data-testid="stMetricDelta"]{
+    font-size:0.9rem;
+}
+
+/* ---------- Buttons ---------- */
+
+.stButton>button{
+    width:100%;
+    border-radius:10px;
+    font-weight:600;
+}
+
+/* ---------- Inputs ---------- */
+
+.stSelectbox,
+.stTextInput,
+.stNumberInput{
+    border-radius:10px;
+}
+
+/* ---------- Sidebar ---------- */
+
+section[data-testid="stSidebar"]{
+    border-right:1px solid rgba(127,127,127,.18);
+}
+
+/* ---------- Note Boxes ---------- */
+
+.note-box{
+    background:rgba(42,93,143,.12);
+    border-left:5px solid #2a5d8f;
+    padding:14px 18px;
+    border-radius:10px;
+    margin:10px 0 18px 0;
+    font-size:0.95rem;
+}
+
+.warn-box{
+    background:rgba(192,57,43,.12);
+    border-left:5px solid #c0392b;
+    padding:14px 18px;
+    border-radius:10px;
+    margin:10px 0 18px 0;
+    font-size:0.95rem;
+}
+
+/* ---------- Tables ---------- */
+
+[data-testid="stDataFrame"]{
+    border-radius:12px;
+    overflow:hidden;
+    border:1px solid rgba(127,127,127,.2);
+}
+
+/* ---------- Expanders ---------- */
+
+details{
+    border-radius:12px;
+    overflow:hidden;
+}
+
+/* ---------- Headers ---------- */
+
+h1{
+    font-weight:700;
+    margin-bottom:.2rem;
+}
+
+h2,h3{
+    margin-top:1rem;
+    margin-bottom:.6rem;
+}
+
+/* ---------- Plotly ---------- */
+
+.js-plotly-plot{
+    border-radius:12px;
+}
+
+/* ---------- Remove White Backgrounds ---------- */
+
+div[data-testid="stMarkdownContainer"]{
+    background:transparent !important;
+}
+
+/* ---------- General Cards ---------- */
+
+div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stMetric"]){
+    margin-bottom:0.5rem;
+}
+
+</style>
+""", unsafe_allow_html=True)
 
 st.title("Worst-of autocallable note pricer")
 st.caption("Multi-asset Heston · Monte Carlo · barrier reverse convertibles, "
