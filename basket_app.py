@@ -1,18 +1,17 @@
 """
-Two-stock basket option pricer — SINGLE FILE (engine + UI, no local imports).
+Two-stock basket structure pricer — SINGLE FILE (engine + UI, no local imports).
 
-Worst-of / best-of, calls and puts, buy or sell, on any two tickers.
-Heston Monte Carlo calibrated to option-implied vols, validated against
-closed forms (Stulz 1982 for options on the min; min/max identity for the max).
-
-Deploy: put this file + requirements.txt in the repo root and point
-Streamlit Cloud at basket_app.py. Nothing else is imported locally.
+Worst-of / best-of · calls and puts · buy or sell · optional knock-in /
+knock-out barriers (continuous or European) · optional autocall.
+Heston Monte Carlo calibrated to option-implied vols; validated against
+closed forms (Stulz 1982 for options on the min; min/max identity for the
+max), in-out barrier parity, and autocall degeneracy checks.
 
 Run locally:  streamlit run basket_app.py
 Self-test:    python basket_app.py --selftest
 """
 
-APP_VERSION = "2.1 single-file, fast calibration"
+APP_VERSION = "3.0 barriers + autocall"
 
 import sys
 import time
@@ -28,20 +27,8 @@ from scipy.stats import multivariate_normal, norm
 
 
 # =============================================================================
-# ENGINE
+# ENGINE — parameters
 # =============================================================================
-
-from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple
-
-import numpy as np
-from scipy.optimize import brentq, least_squares
-from scipy.stats import multivariate_normal, norm
-
-
-# -----------------------------------------------------------------------------
-# Parameters
-# -----------------------------------------------------------------------------
 
 @dataclass
 class Asset:
@@ -60,12 +47,21 @@ class Asset:
 
 @dataclass
 class OptionSpec:
-    basket_type: str = "worst"    # "worst" | "best"
-    option_type: str = "put"      # "put"   | "call"
+    basket_type: str = "worst"      # "worst" | "best"
+    option_type: str = "put"        # "put"   | "call"
     strike_pct: float = 0.70
     tenor_years: float = 1.0
     r: float = 0.04
     notional: float = 1_000_000.0
+    # ---- optional barrier on the option ----
+    barrier_mode: str = "none"      # "none" | "ki" | "ko"
+    barrier_level: float = 0.60     # fraction of initial fixing
+    barrier_obs: str = "continuous" # "continuous" | "european"
+    # ---- optional autocall (early termination of the structure) ----
+    autocall: bool = False
+    ac_freq_per_year: int = 4
+    ac_trigger: float = 1.00        # structure ends when aggregate >= trigger
+    ac_first_obs: int = 1
 
 
 @dataclass
@@ -74,21 +70,30 @@ class Result:
     stderr_pct: float
     premium_cash: float
     prob_itm: float
-    prob_driver_is: np.ndarray    # P(asset i sets the aggregate | ITM)
+    prob_driver_is: np.ndarray
     exp_payoff_pct: float
     exp_payoff_given_itm: float
     max_payoff_pct: float
     var95_payoff_pct: float
     cvar95_payoff_pct: float
-    breakeven_agg: float          # aggregate level where seller P&L = 0
+    breakeven_agg: float
     seller_pnl_pct: np.ndarray
     agg_T: np.ndarray
     perf_T: np.ndarray
-    sample_paths: np.ndarray      # aggregate (worst/best) trajectories
+    sample_paths: np.ndarray
+    sample_exit_step: np.ndarray
     time_grid: np.ndarray
     deltas: np.ndarray
     vegas: np.ndarray
     corr_sens: float
+    # barrier / autocall analytics
+    prob_barrier_event: float       # P(knocked) for ki/ko, else 0
+    prob_autocall: np.ndarray       # P(called at obs k)
+    prob_alive_obs: np.ndarray      # P(alive at obs k, pre-call)
+    obs_times: np.ndarray
+    exp_life_years: float
+    fair_coupon_pa: float           # coupon p.a. this premium would fund
+
 
 
 # -----------------------------------------------------------------------------
@@ -346,13 +351,22 @@ def estimate_heston_from_returns(log_returns: np.ndarray,
     return {"v0": v0, "theta": theta, "kappa": kappa, "xi": xi, "rho_sv": rho}
 
 
-# -----------------------------------------------------------------------------
-# Monte Carlo
-# -----------------------------------------------------------------------------
 
-def _simulate_terminal(a1: Asset, a2: Asset, rho_s: float, spec: OptionSpec,
-                       n_paths: int, steps_per_year: int, seed: int,
-                       n_saved: int = 0, basket_type: str = "worst"):
+# =============================================================================
+# ENGINE — Monte Carlo with barriers and autocall
+# =============================================================================
+
+def _mc_run(a1: Asset, a2: Asset, rho_s: float, spec: OptionSpec,
+            n_paths: int, steps_per_year: int, seed: int,
+            spot_mult=(1.0, 1.0), n_saved: int = 0):
+    """
+    One Heston MC pass. Returns a dict of everything the pricer needs.
+
+    spot_mult: post-inception spot bumps applied to each asset's performance
+    at EVERY step (perf paths don't depend on the spot level under Heston, so
+    a bumped-spot path is exactly mult x the base path). Barrier and autocall
+    checks are done on the bumped performance, so Greeks see the features.
+    """
     T = spec.tenor_years
     n_steps = max(int(round(T * steps_per_year)), 2)
     dt, sqdt = T / n_steps, np.sqrt(T / n_steps)
@@ -363,17 +377,44 @@ def _simulate_terminal(a1: Asset, a2: Asset, rho_s: float, spec: OptionSpec,
 
     rho_s = float(np.clip(rho_s, -0.999, 0.999))
     L = np.linalg.cholesky(np.array([[1.0, rho_s], [rho_s, 1.0]]))
-    S0 = np.array([a1.spot, a2.spot])
     q = np.array([a1.div_yield, a2.div_yield])
     kap = np.array([a1.kappa, a2.kappa]); th = np.array([a1.theta, a2.theta])
     xi = np.array([a1.xi, a2.xi]); rho = np.array([a1.rho_sv, a2.rho_sv])
     rho_c = np.sqrt(np.clip(1 - rho**2, 0, 1))
+    mult = np.asarray(spot_mult, float)
 
-    S = np.tile(S0, (n_paths, 1))
+    worst = spec.basket_type == "worst"
+    aggfun = (lambda p: p.min(axis=1)) if worst else (lambda p: p.max(axis=1))
+    down = spec.option_type == "put"          # barrier direction follows payoff
+    B = spec.barrier_level
+    cont_barrier = (spec.barrier_mode != "none"
+                    and spec.barrier_obs == "continuous")
+    # Brownian bridge is exact for "any asset crosses" events:
+    #   worst-of with a down barrier  (worst<=B  <=>  any perf<=B)
+    #   best-of  with an up barrier   (best>=B   <=>  any perf>=B)
+    bridge = cont_barrier and ((worst and down) or ((not worst) and not down))
+
+    obs_steps = np.array([], dtype=int)
+    if spec.autocall:
+        n_obs = max(int(round(T * spec.ac_freq_per_year)), 1)
+        obs_steps = np.unique(np.round(
+            np.arange(1, n_obs + 1) * n_steps / n_obs).astype(int))
+    obs_ptr = {int(s): k for k, s in enumerate(obs_steps)}
+    obs_times = obs_steps * dt
+
+    perf = np.tile(mult, (n_paths, 1))
     v = np.tile([a1.v0, a2.v0], (n_paths, 1))
-    saved = np.ones((n_saved, n_steps + 1)) if n_saved else None
+    alive = np.ones(n_paths, dtype=bool)
+    crossed = np.zeros(n_paths, dtype=bool)
+    log_surv = np.zeros(n_paths)
+    exit_step = np.full(n_paths, n_steps, dtype=int)
+    prob_ac = np.zeros(len(obs_steps))
+    prob_alive = np.zeros(len(obs_steps))
+
+    n_save = min(n_saved, n_paths)
+    saved = (np.tile(aggfun(perf[:n_save]), (n_steps + 1, 1)).T
+             if n_save else None)
     tg = np.linspace(0, T, n_steps + 1)
-    aggfun = np.min if basket_type == "worst" else np.max
 
     for t in range(1, n_steps + 1):
         Zs_h = rng.standard_normal((half, 2))
@@ -382,43 +423,98 @@ def _simulate_terminal(a1: Asset, a2: Asset, rho_s: float, spec: OptionSpec,
         Zc = Zs @ L.T
         Zv = rho * Zc + rho_c * Zw
         vp = np.maximum(v, 0.0); sq = np.sqrt(vp)
-        S = S * np.exp((spec.r - q - 0.5 * vp) * dt + sq * sqdt * Zc)
+        prev = perf
+        perf = perf * np.exp((spec.r - q - 0.5 * vp) * dt + sq * sqdt * Zc)
         v = v + kap * (th - vp) * dt + xi * sq * sqdt * Zv
-        if n_saved:
-            saved[:, t] = aggfun(S[:n_saved] / S0, axis=1)
+        agg = aggfun(perf)
 
-    return S / S0, saved, tg
+        if cont_barrier:
+            if bridge:
+                hit = (perf <= B).any(axis=1) if down else (perf >= B).any(axis=1)
+                crossed |= hit & alive
+                ok = ~crossed & alive
+                if ok.any():
+                    var_step = np.maximum(vp, 1e-8) * dt
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        if down:
+                            p = np.exp(-2.0 * np.log(prev / B)
+                                       * np.log(perf / B) / var_step)
+                            valid = (prev > B) & (perf > B)
+                        else:
+                            p = np.exp(-2.0 * np.log(B / prev)
+                                       * np.log(B / perf) / var_step)
+                            valid = (prev < B) & (perf < B)
+                    p = np.where(valid, np.clip(p, 0.0, 1.0 - 1e-12), 0.0)
+                    inc = np.log1p(-p).sum(axis=1)
+                    log_surv = np.where(ok, log_surv + inc, log_surv)
+            else:
+                # "all assets" events: discrete daily monitoring of the aggregate
+                hit = (agg <= B) if down else (agg >= B)
+                crossed |= hit & alive
+
+        if t in obs_ptr and t < n_steps:
+            k = obs_ptr[t]
+            prob_alive[k] = alive.mean()
+            if (k + 1) >= spec.ac_first_obs:
+                call = alive & (agg >= spec.ac_trigger)
+                prob_ac[k] = call.mean()
+                exit_step = np.where(call, t, exit_step)
+                alive &= ~call
+        elif t in obs_ptr:
+            prob_alive[obs_ptr[t]] = alive.mean()
+
+        if n_save:
+            done = exit_step[:n_save] < t
+            saved[:, t] = np.where(done, saved[:, t - 1], agg[:n_save])
+
+    agg_T = aggfun(perf)
+    if spec.barrier_mode == "none":
+        surv = np.ones(n_paths)
+    elif spec.barrier_obs == "european":
+        hitT = (agg_T <= B) if down else (agg_T >= B)
+        surv = (~hitT).astype(float)
+    else:
+        surv = np.where(crossed, 0.0,
+                        np.exp(log_surv) if bridge else 1.0)
+
+    return dict(perf_T=perf, agg_T=agg_T, alive=alive, surv=surv,
+                prob_ac=prob_ac, prob_alive=prob_alive, obs_times=obs_times,
+                exit_step=exit_step, n_steps=n_steps, saved=saved, tg=tg)
 
 
-def _payoff(perf: np.ndarray, spec: OptionSpec) -> np.ndarray:
-    agg = perf.min(axis=1) if spec.basket_type == "worst" else perf.max(axis=1)
-    if spec.option_type == "put":
-        return np.maximum(spec.strike_pct - agg, 0.0)
-    return np.maximum(agg - spec.strike_pct, 0.0)
+def _effective_payoff(sim: dict, spec: OptionSpec):
+    """Per-path effective payoff at maturity (0 for autocalled paths)."""
+    K = spec.strike_pct
+    base = (np.maximum(K - sim["agg_T"], 0.0) if spec.option_type == "put"
+            else np.maximum(sim["agg_T"] - K, 0.0))
+    if spec.barrier_mode == "ki":
+        base = base * (1.0 - sim["surv"])
+    elif spec.barrier_mode == "ko":
+        base = base * sim["surv"]
+    return np.where(sim["alive"], base, 0.0)
 
 
 def price_basket_option(a1: Asset, a2: Asset, rho_s: float, spec: OptionSpec,
                         n_paths: int = 50_000, steps_per_year: int = 252,
-                        seed: Optional[int] = 42, n_saved: int = 200,
+                        seed: Optional[int] = 42, n_saved: int = 150,
                         greeks: bool = True) -> Result:
-    perf, saved, tg = _simulate_terminal(a1, a2, rho_s, spec, n_paths,
-                                         steps_per_year, seed, n_saved,
-                                         spec.basket_type)
-    n_paths = perf.shape[0]
-    agg = perf.min(axis=1) if spec.basket_type == "worst" else perf.max(axis=1)
-    K = spec.strike_pct
-    df = np.exp(-spec.r * spec.tenor_years)
+    sim = _mc_run(a1, a2, rho_s, spec, n_paths, steps_per_year, seed,
+                  n_saved=n_saved)
+    n_paths = sim["perf_T"].shape[0]
+    T, K = spec.tenor_years, spec.strike_pct
+    df = np.exp(-spec.r * T)
 
-    payoff = _payoff(perf, spec)
+    payoff = _effective_payoff(sim, spec)
     pv = df * payoff
     premium = float(pv.mean())
     stderr = float(pv.std(ddof=1) / np.sqrt(n_paths))
 
-    itm = payoff > 0
+    itm = payoff > 1e-12
     p_itm = float(itm.mean())
+    perf_T = sim["perf_T"]
     if itm.any():
-        which = (perf[itm].argmin(axis=1) if spec.basket_type == "worst"
-                 else perf[itm].argmax(axis=1))
+        which = (perf_T[itm].argmin(axis=1) if spec.basket_type == "worst"
+                 else perf_T[itm].argmax(axis=1))
         p_which = np.array([(which == 0).mean(), (which == 1).mean()])
         e_pay_itm = float(payoff[itm].mean())
     else:
@@ -430,17 +526,35 @@ def price_basket_option(a1: Asset, a2: Asset, rho_s: float, spec: OptionSpec,
     cvar95 = float(tail[: max(int(0.05 * n_paths), 1)].mean())
     be = (K - premium / df) if spec.option_type == "put" else (K + premium / df)
 
-    pct = lambda x: 100.0 * x
+    # ---- autocall analytics & the coupon this premium would fund ----
+    exit_t = np.where(sim["exit_step"] < sim["n_steps"],
+                      sim["exit_step"] / sim["n_steps"] * T, T)
+    exp_life = float(exit_t.mean())
+    if spec.autocall and len(sim["obs_times"]):
+        annuity = float(np.sum(np.exp(-spec.r * sim["obs_times"])
+                               * sim["prob_alive"]))
+        fair_coupon = (premium / annuity * spec.ac_freq_per_year * 100.0
+                       if annuity > 1e-9 else 0.0)
+    else:
+        f = 4
+        ts = np.arange(1, int(round(T * f)) + 1) / f
+        annuity = float(np.sum(np.exp(-spec.r * ts)))
+        fair_coupon = premium / annuity * f * 100.0 if annuity > 0 else 0.0
 
+    if spec.barrier_mode != "none":
+        p_barrier = float(np.mean(1.0 - sim["surv"]))
+    else:
+        p_barrier = 0.0
+
+    pct = lambda x: 100.0 * x
     deltas = np.zeros(2); vegas = np.zeros(2); corr_sens = 0.0
     if greeks:
         ng = min(n_paths, 30_000)
 
-        def px(aa1, aa2, rs, spot_mult=(1.0, 1.0)):
-            p, _, _ = _simulate_terminal(aa1, aa2, rs, spec, ng,
-                                         steps_per_year, seed, 0,
-                                         spec.basket_type)
-            return pct(df * _payoff(p * np.asarray(spot_mult), spec).mean())
+        def px(aa1, aa2, rs, sm=(1.0, 1.0)):
+            s = _mc_run(aa1, aa2, rs, spec, ng, steps_per_year, seed,
+                        spot_mult=sm)
+            return pct(df * _effective_payoff(s, spec).mean())
 
         base = px(a1, a2, rho_s)
         for i, a in enumerate((a1, a2)):
@@ -451,8 +565,8 @@ def price_basket_option(a1: Asset, a2: Asset, rho_s: float, spec: OptionSpec,
             vol = np.sqrt(a.v0)
             vu = replace(a, v0=(vol + 0.01) ** 2,
                          theta=(np.sqrt(a.theta) + 0.01) ** 2)
-            args_v = (vu, a2, rho_s) if i == 0 else (a1, vu, rho_s)
-            vegas[i] = px(*args_v) - base
+            args = (vu, a2, rho_s) if i == 0 else (a1, vu, rho_s)
+            vegas[i] = px(*args) - base
         corr_sens = px(a1, a2, min(rho_s + 0.05, 0.999)) - base
 
     return Result(
@@ -464,15 +578,12 @@ def price_basket_option(a1: Asset, a2: Asset, rho_s: float, spec: OptionSpec,
         max_payoff_pct=pct(payoff.max()),
         var95_payoff_pct=pct(var95), cvar95_payoff_pct=pct(cvar95),
         breakeven_agg=be, seller_pnl_pct=pct(seller_pnl),
-        agg_T=agg, perf_T=perf, sample_paths=saved, time_grid=tg,
-        deltas=deltas, vegas=vegas, corr_sens=corr_sens)
-
-
-# -----------------------------------------------------------------------------
-# Self-tests
-# -----------------------------------------------------------------------------
-
-
+        agg_T=sim["agg_T"], perf_T=perf_T,
+        sample_paths=sim["saved"], sample_exit_step=sim["exit_step"],
+        time_grid=sim["tg"], deltas=deltas, vegas=vegas, corr_sens=corr_sens,
+        prob_barrier_event=p_barrier, prob_autocall=sim["prob_ac"],
+        prob_alive_obs=sim["prob_alive"], obs_times=sim["obs_times"],
+        exp_life_years=exp_life, fair_coupon_pa=fair_coupon)
 
 
 # =============================================================================
@@ -483,6 +594,8 @@ def _selftest():
     s1, s2, rho, T, r = 0.45, 0.55, 0.55, 1.0, 0.04
     a1 = Asset("A", 250.0, 0.0, v0=s1**2, kappa=1.0, theta=s1**2, xi=1e-4, rho_sv=0.0)
     a2 = Asset("B", 130.0, 0.0, v0=s2**2, kappa=1.0, theta=s2**2, xi=1e-4, rho_sv=0.0)
+
+    # 1) all four payoff types vs Black-Scholes closed forms (no features)
     for bt, ot, K in [("worst", "put", 0.70), ("worst", "call", 1.00),
                       ("best", "call", 1.30), ("best", "put", 1.00)]:
         spec = OptionSpec(bt, ot, K, T, r)
@@ -494,7 +607,38 @@ def _selftest():
         print(f"{bt:>5}-of {ot:<4} K={K:.0%}: analytic={ana:.5f} MC={mc:.5f} "
               f"{'OK' if ok else 'FAIL'}")
         assert ok
-    print(f"basket_app v{APP_VERSION}: all closed-form checks passed.")
+
+    # 2) in-out parity: KI + KO = vanilla (exact pathwise, same seed)
+    van = OptionSpec("worst", "put", 0.70, T, r)
+    ki = replace(van, barrier_mode="ki", barrier_level=0.60,
+                 barrier_obs="continuous")
+    ko = replace(ki, barrier_mode="ko")
+    pv = price_basket_option(a1, a2, rho, van, 100_000, seed=7, greeks=False)
+    pi = price_basket_option(a1, a2, rho, ki, 100_000, seed=7, greeks=False)
+    po = price_basket_option(a1, a2, rho, ko, 100_000, seed=7, greeks=False)
+    gap = abs(pi.premium_pct + po.premium_pct - pv.premium_pct)
+    print(f"in-out parity: KI {pi.premium_pct:.3f} + KO {po.premium_pct:.3f} "
+          f"= {pi.premium_pct+po.premium_pct:.3f} vs vanilla "
+          f"{pv.premium_pct:.3f}  {'OK' if gap < 1e-6 else 'FAIL'}")
+    assert gap < 1e-6
+
+    # 3) unreachable autocall trigger reproduces the plain option exactly
+    ac = replace(van, autocall=True, ac_trigger=50.0, ac_freq_per_year=4)
+    pa = price_basket_option(a1, a2, rho, ac, 100_000, seed=7, greeks=False)
+    gap = abs(pa.premium_pct - pv.premium_pct)
+    print(f"autocall degeneracy: trigger=5000% -> {pa.premium_pct:.3f} vs "
+          f"vanilla {pv.premium_pct:.3f}  {'OK' if gap < 1e-6 else 'FAIL'}")
+    assert gap < 1e-6
+
+    # 4) autocall must cheapen the option; KI must cheapen vs vanilla
+    ac2 = replace(van, autocall=True, ac_trigger=1.00, ac_freq_per_year=4)
+    pa2 = price_basket_option(a1, a2, rho, ac2, 100_000, seed=7, greeks=False)
+    print(f"autocall@100% premium {pa2.premium_pct:.3f} < vanilla "
+          f"{pv.premium_pct:.3f}: "
+          f"{'OK' if pa2.premium_pct < pv.premium_pct else 'FAIL'}")
+    assert pa2.premium_pct < pv.premium_pct and pi.premium_pct < pv.premium_pct
+
+    print(f"basket_app v{APP_VERSION}: all self-tests passed.")
 
 
 if "--selftest" in sys.argv:
@@ -506,21 +650,35 @@ if "--selftest" in sys.argv:
 # STREAMLIT UI
 # =============================================================================
 
-st.set_page_config(page_title="Basket Option Pricer", page_icon="🧾", layout="wide")
+st.set_page_config(page_title="Basket Structure Pricer", page_icon="🧾",
+                   layout="wide")
 
 ACCENT, RED, GREEN, GRAY, AMBER = "#4b8bc4", "#d6564a", "#2aa574", "#8a8a85", "#cf9b2c"
 
-# Theme-adaptive styling: translucent fills + inherited text color, so nothing
-# renders as a white box hiding text in dark mode.
+# Theme-adaptive styling. Metric values are allowed to WRAP (no "..." ellipsis):
 st.markdown("""
 <style>
-  .block-container {padding-top: 2.2rem; max-width: 1250px;}
+  .block-container {padding-top: 2.0rem; max-width: 1250px;}
   div[data-testid="stMetric"] {
     background: rgba(128,128,128,0.10);
     border: 1px solid rgba(128,128,128,0.28);
-    border-radius: 10px; padding: 14px 18px;
+    border-radius: 10px; padding: 12px 14px;
   }
   div[data-testid="stMetric"] * {color: inherit;}
+  div[data-testid="stMetricValue"] {font-size: 1.28rem; line-height: 1.2;}
+  div[data-testid="stMetricValue"] > div {
+    white-space: normal !important; overflow: visible !important;
+    text-overflow: clip !important; overflow-wrap: anywhere;
+  }
+  div[data-testid="stMetricLabel"] {white-space: normal !important;}
+  div[data-testid="stMetricLabel"] p {
+    white-space: normal !important; overflow: visible !important;
+    text-overflow: clip !important; font-size: 0.80rem;
+  }
+  div[data-testid="stMetricDelta"] > div {
+    white-space: normal !important; overflow: visible !important;
+    text-overflow: clip !important; font-size: 0.74rem;
+  }
   .note-box {background: rgba(75,139,196,0.14); border-left: 4px solid #4b8bc4;
     padding: 12px 16px; border-radius: 0 8px 8px 0; font-size: .92rem;
     margin: 6px 0 14px 0; color: inherit;}
@@ -529,9 +687,21 @@ st.markdown("""
     margin: 6px 0 14px 0; color: inherit;}
 </style>""", unsafe_allow_html=True)
 
-st.title("Two-stock basket option pricer")
-st.caption(f"Worst-of / best-of · calls and puts · sell or buy · Heston Monte Carlo "
-           f"calibrated to option-implied vols, validated against closed forms · v{APP_VERSION}")
+
+def money(x: float) -> str:
+    ax = abs(x)
+    if ax >= 1e9:
+        return f"${x/1e9:,.2f}B"
+    if ax >= 1e6:
+        return f"${x/1e6:,.2f}M"
+    if ax >= 1e4:
+        return f"${x/1e3:,.0f}k"
+    return f"${x:,.0f}"
+
+
+st.title("Two-stock basket structure pricer")
+st.caption(f"Worst-of / best-of · calls & puts · optional barriers & autocall · "
+           f"Heston MC calibrated to implied vols · v{APP_VERSION}")
 
 # ----------------------------------------------------------------- data layer
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -557,21 +727,16 @@ def fetch_hist(tickers: tuple, lookback: str):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_option_quotes(ticker: str, spot: float, tenor: float):
-    """OTM implied-vol quotes from the listed option chain, on expiries
-    bracketing the trade tenor. Returns list of (T, K, iv)."""
+    """OTM implied-vol quotes from two expiries bracketing the tenor."""
     import datetime as dtm
     import yfinance as yf
     tk = yf.Ticker(ticker)
     today = dtm.date.today()
-    exps = []
-    for e in tk.options:
-        T = (dtm.date.fromisoformat(e) - today).days / 365.25
-        if T > 0.05:
-            exps.append((e, T))
+    exps = [(e, (dtm.date.fromisoformat(e) - today).days / 365.25)
+            for e in tk.options]
+    exps = [x for x in exps if x[1] > 0.05]
     if not exps:
         raise ValueError("No listed expiries found.")
-    # Two expiries bracketing the tenor is enough to pin the smile AND its
-    # term structure; each extra expiry is another network round-trip.
     chosen = []
     for target in (tenor, 0.6 * tenor):
         e = min(exps, key=lambda x: abs(x[1] - target))
@@ -589,7 +754,7 @@ def fetch_option_quotes(ticker: str, spot: float, tenor: float):
             else:
                 df = df[(df["strike"] > spot) & (df["strike"] <= 1.5 * spot)]
             df = df.sort_values("strike")
-            if len(df) > 6:                       # thin to ~6 per side
+            if len(df) > 6:
                 df = df.iloc[np.linspace(0, len(df) - 1, 6).astype(int)]
             for _, row in df.iterrows():
                 quotes.append((float(T), float(row["strike"]),
@@ -599,11 +764,9 @@ def fetch_option_quotes(ticker: str, spot: float, tenor: float):
     return quotes
 
 
-
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_calibrate(ticker: str, spot: float, tenor: float, r: float,
                      q: float, x0: dict):
-    """Cached so changing an unrelated widget doesn't refit the smile."""
     quotes = fetch_option_quotes(ticker, spot, tenor)
     fit = calibrate_heston(quotes, spot, r, q, x0)
     return fit, quotes
@@ -611,35 +774,75 @@ def cached_calibrate(ticker: str, spot: float, tenor: float, r: float,
 
 # --------------------------------------------------------------------- sidebar
 with st.sidebar:
-    st.header("Underlyings")
-    t1 = st.text_input("Ticker 1", "NVDA").strip().upper()
-    t2 = st.text_input("Ticker 2", "TSLA").strip().upper()
-    tickers = (t1, t2)
-    lookback = st.selectbox("History window", ["1y", "2y", "3y", "5y"], 1)
-    use_live = st.toggle("Fetch live market data (yfinance)", True)
-    calib_src = st.radio("Heston calibration",
-                         ["Option-implied vols (recommended)",
-                          "Historical returns"],
-                         help="Implied calibration fits v0, kappa, theta, xi, rho "
-                              "to the listed option smile — the market-consistent "
-                              "choice. Falls back to historical if no chain data.")
+    st.header("Trade setup")
 
-    st.header("Trade")
-    basket_type = st.radio("Basket", ["Worst-of", "Best-of"], horizontal=True)
-    option_type = st.radio("Option", ["Put", "Call"], horizontal=True)
-    position = st.radio("Your position", ["Sell", "Buy"], horizontal=True)
-    strike_pct = st.slider("Strike (% of spot)", 40, 160, 70, 1) / 100
-    tenor = st.slider("Tenor (years)", 0.25, 3.0, 1.0, 0.25)
-    notional = st.number_input("Notional (USD)", 10_000, 1_000_000_000,
-                               1_000_000, step=10_000)
-    r = st.number_input("Risk-free rate (% p.a.)", 0.0, 15.0, 4.0, 0.1) / 100
+    with st.expander("Underlyings & data", expanded=True):
+        t1 = st.text_input("Ticker 1", "NVDA").strip().upper()
+        t2 = st.text_input("Ticker 2", "TSLA").strip().upper()
+        lookback = st.selectbox("History window", ["1y", "2y", "3y", "5y"], 1)
+        use_live = st.toggle("Live market data (yfinance)", True)
+        calib_src = st.radio("Heston calibration",
+                             ["Option-implied vols", "Historical returns"],
+                             help="Implied fits v0, kappa, theta, xi, rho to "
+                                  "the listed smile (market-consistent). Falls "
+                                  "back to historical if no chain data.")
 
-    st.header("Simulation")
-    n_paths = st.select_slider("Monte Carlo paths",
-                               [10_000, 20_000, 50_000, 100_000, 200_000], 50_000)
-    seed = st.number_input("Random seed", 0, 10_000, 42)
-    do_greeks = st.toggle("Compute Greeks (slower)", True)
+    with st.expander("Payoff", expanded=True):
+        basket_type = st.radio("Basket", ["Worst-of", "Best-of"], horizontal=True)
+        option_type = st.radio("Option", ["Put", "Call"], horizontal=True)
+        position = st.radio("Your position", ["Sell", "Buy"], horizontal=True)
+        strike_pct = st.slider("Strike (% of spot)", 40, 160, 70, 1) / 100
+        tenor = st.slider("Tenor (years)", 0.25, 3.0, 1.0, 0.25)
+        notional = st.number_input("Notional (USD)", 10_000, 1_000_000_000,
+                                   1_000_000, step=10_000)
 
+    with st.expander("Barrier (optional)"):
+        b_mode_lbl = st.radio("Barrier type",
+                              ["None", "Knock-in", "Knock-out"], index=0,
+                              help="Knock-in: the option only pays if the "
+                                   "barrier was crossed. Knock-out: it dies "
+                                   "when crossed. Direction follows the "
+                                   "payoff: down for puts, up for calls.")
+        barrier_mode = {"None": "none", "Knock-in": "ki",
+                        "Knock-out": "ko"}[b_mode_lbl]
+        barrier_level = st.slider("Barrier level (% of initial)", 20, 200,
+                                  60, 1,
+                                  disabled=barrier_mode == "none") / 100
+        barrier_obs_lbl = st.radio("Barrier observation",
+                                   ["Continuous (American)",
+                                    "At maturity (European)"],
+                                   disabled=barrier_mode == "none")
+        barrier_obs = ("continuous" if barrier_obs_lbl.startswith("Cont")
+                       else "european")
+
+    with st.expander("Autocall (optional)"):
+        autocall = st.toggle("Autocallable structure", False,
+                             help="At each observation date, if the basket "
+                                  "aggregate closes at or above the trigger, "
+                                  "the structure terminates early and the "
+                                  "option is extinguished (worth 0 from then "
+                                  "on) — this is what protects note "
+                                  "investors' short puts.")
+        ac_freq_lbl = st.selectbox("Observation frequency",
+                                   ["Monthly", "Quarterly", "Semi-annual",
+                                    "Annual"], 1, disabled=not autocall)
+        ac_freq = {"Monthly": 12, "Quarterly": 4, "Semi-annual": 2,
+                   "Annual": 1}[ac_freq_lbl]
+        ac_trigger = st.slider("Autocall trigger (% of initial)", 70, 150,
+                               100, 1, disabled=not autocall) / 100
+        ac_first = st.number_input("First callable observation #", 1, 24, 1,
+                                   disabled=not autocall)
+
+    with st.expander("Market & simulation"):
+        r = st.number_input("Risk-free rate (% p.a.)", 0.0, 15.0, 4.0,
+                            0.1) / 100
+        n_paths = st.select_slider("Monte Carlo paths",
+                                   [10_000, 20_000, 50_000, 100_000, 200_000],
+                                   50_000)
+        seed = st.number_input("Random seed", 0, 10_000, 42)
+        do_greeks = st.toggle("Compute Greeks (slower)", True)
+
+tickers = (t1, t2)
 if t1 == t2 or not t1 or not t2:
     st.error("Enter two different, non-empty tickers.")
     st.stop()
@@ -647,7 +850,16 @@ if t1 == t2 or not t1 or not t2:
 bt = "worst" if basket_type == "Worst-of" else "best"
 ot = option_type.lower()
 selling = position == "Sell"
-sgn = 1.0 if selling else -1.0     # premium flows to you if selling
+sgn = 1.0 if selling else -1.0
+
+feat = []
+if barrier_mode != "none":
+    feat.append(f"{b_mode_lbl.lower()} @ {barrier_level:.0%} "
+                f"({'cont.' if barrier_obs=='continuous' else 'Euro.'})")
+if autocall:
+    feat.append(f"autocall {ac_freq_lbl.lower()} @ {ac_trigger:.0%}")
+trade_name = f"{basket_type} {ot}"
+trade_full = trade_name + (f" · {' · '.join(feat)}" if feat else "")
 
 # ------------------------------------------------------------ market data path
 data_ok, err = False, ""
@@ -673,7 +885,8 @@ if not data_ok:
             st.markdown(f"**{t}**")
             spots[t] = st.number_input(f"Spot {t}", 0.01, 1e6, 100.0, key=f"s{i}")
             vols[t] = st.number_input(f"Vol {t} (% p.a.)", 1.0, 300.0,
-                                      45.0 if i == 0 else 55.0, key=f"v{i}") / 100
+                                      45.0 if i == 0 else 55.0,
+                                      key=f"v{i}") / 100
             divs[t] = st.number_input(f"Div yield {t} (%)", 0.0, 20.0, 0.0,
                                       key=f"d{i}") / 100
     rho_hist = st.slider("Spot correlation", -0.5, 0.99, 0.55, 0.01)
@@ -682,7 +895,7 @@ if not data_ok:
 # --------------------------------------------------- calibration per underlying
 st.subheader("1 · Model calibration")
 
-assets, calib_info, smiles = [], [], {}
+assets, smiles = [], {}
 cols = st.columns(2)
 for i, t in enumerate(tickers):
     est, source = None, ""
@@ -694,7 +907,7 @@ for i, t in enumerate(tickers):
                 est, quotes = cached_calibrate(t, spots[t], tenor, r,
                                                divs.get(t, 0.0), x0)
                 source = (f"option-implied · {est['n_quotes']} quotes · "
-                          f"fit RMSE {est['rmse_iv']*100:.2f} vol pts · "
+                          f"RMSE {est['rmse_iv']*100:.2f} vol pts · "
                           f"{time.time()-_t0:.1f}s")
                 smiles[t] = quotes
         except Exception as e:
@@ -708,35 +921,37 @@ for i, t in enumerate(tickers):
             source = "historical returns (fallback)"
         else:
             vv = vols[t] ** 2
-            est = {"v0": vv, "theta": vv, "kappa": 2.0, "xi": 0.8, "rho_sv": -0.6}
+            est = {"v0": vv, "theta": vv, "kappa": 2.0, "xi": 0.8,
+                   "rho_sv": -0.6}
             source = "manual flat vol"
 
     with cols[i]:
         st.markdown(f"**{t}** · spot **{spots[t]:,.2f}** · strike "
                     f"**{spots[t]*strike_pct:,.2f}** ({strike_pct:.0%})")
         st.caption(f"Calibration: {source}")
-        v0 = st.number_input("v₀", 0.0001, 4.0, float(round(est["v0"], 4)),
-                             format="%.4f", key=f"v0{i}")
-        th = st.number_input("θ", 0.0001, 4.0, float(round(est["theta"], 4)),
-                             format="%.4f", key=f"th{i}")
-        ka = st.number_input("κ", 0.05, 15.0, float(round(est["kappa"], 2)),
-                             key=f"ka{i}")
-        xv = st.number_input("ξ (vol of vol)", 0.01, 3.0,
-                             float(round(est["xi"], 2)), key=f"xi{i}")
-        rh = st.number_input("ρ spot-vol", -0.99, 0.5,
-                             float(round(est["rho_sv"], 2)), key=f"rh{i}")
+        with st.expander(f"Heston parameters — {t}", expanded=False):
+            v0 = st.number_input("v₀", 0.0001, 4.0, float(round(est["v0"], 4)),
+                                 format="%.4f", key=f"v0{i}")
+            th = st.number_input("θ", 0.0001, 4.0,
+                                 float(round(est["theta"], 4)),
+                                 format="%.4f", key=f"th{i}")
+            ka = st.number_input("κ", 0.05, 15.0,
+                                 float(round(est["kappa"], 2)), key=f"ka{i}")
+            xv = st.number_input("ξ (vol of vol)", 0.01, 3.0,
+                                 float(round(est["xi"], 2)), key=f"xi{i}")
+            rh = st.number_input("ρ spot-vol", -0.99, 0.5,
+                                 float(round(est["rho_sv"], 2)), key=f"rh{i}")
         st.caption(f"√v₀ = {np.sqrt(v0):.1%} · √θ = {np.sqrt(th):.1%}")
         assets.append(Asset(t, spots[t], divs.get(t, 0.0), v0, ka, th, xv, rh))
 
 rho_s = st.slider("Spot correlation between the two stocks", -0.5, 0.99,
                   float(round(np.clip(rho_hist, -0.5, 0.99), 2)), 0.01)
 
-# fit-quality smile charts
 if smiles:
     cols = st.columns(len(smiles))
     for i, (t, quotes) in enumerate(smiles.items()):
         a = assets[tickers.index(t)]
-        Ts = sorted({round(q[0], 3) for q in quotes})
+        Ts = sorted({round(qq[0], 3) for qq in quotes})
         Tn = min(Ts, key=lambda x: abs(x - tenor))
         pts = [(k, iv) for (tt, k, iv) in quotes if round(tt, 3) == Tn]
         ks = np.array([p[0] for p in pts]); ivs = np.array([p[1] for p in pts])
@@ -752,37 +967,34 @@ if smiles:
                                      mode="lines", name="Heston fit",
                                      line=dict(color=ACCENT, width=2)))
             fig.add_vline(x=strike_pct * 100, line_dash="dot", line_color=RED,
-                          annotation_text="trade strike")
-            fig.update_layout(title=f"{t} implied-vol smile (T≈{Tn:.2f}y)",
-                              height=280, margin=dict(l=10, r=10, t=45, b=10),
+                          annotation_text="strike")
+            fig.update_layout(title=f"{t} smile (T≈{Tn:.2f}y)", height=270,
+                              margin=dict(l=10, r=10, t=45, b=10),
                               xaxis_title="Strike (% of spot)",
                               yaxis_title="Implied vol (%)",
                               legend=dict(x=0.55, y=0.98))
             st.plotly_chart(fig, use_container_width=True)
-    st.markdown("<div class='note-box'>The Heston fit should hug the market "
-                "points, especially near your trade strike (red line) — that's "
-                "the region that prices this option. A poor fit there means "
-                "adjust parameters manually.</div>", unsafe_allow_html=True)
 
 if data_ok and hist is not None:
-    norm_px = hist / hist.iloc[0] * 100
-    fig = go.Figure()
-    for t in tickers:
-        fig.add_trace(go.Scatter(x=norm_px.index, y=norm_px[t], name=t,
-                                 line=dict(width=1.6)))
-    fig.update_layout(title=f"Normalised history ({lookback}) · realized corr "
-                            f"= {rho_hist:.2f}", height=260,
-                      margin=dict(l=10, r=10, t=45, b=10),
-                      yaxis_title="Rebased to 100")
-    st.plotly_chart(fig, use_container_width=True)
+    with st.expander("Price history", expanded=False):
+        norm_px = hist / hist.iloc[0] * 100
+        fig = go.Figure()
+        for t in tickers:
+            fig.add_trace(go.Scatter(x=norm_px.index, y=norm_px[t], name=t,
+                                     line=dict(width=1.6)))
+        fig.update_layout(title=f"Normalised ({lookback}) · realized corr "
+                                f"= {rho_hist:.2f}", height=260,
+                          margin=dict(l=10, r=10, t=45, b=10),
+                          yaxis_title="Rebased to 100")
+        st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------------------- price
-spec = OptionSpec(bt, ot, strike_pct, tenor, r, notional)
-trade_name = f"{basket_type} {option_type.lower()}"
+spec = OptionSpec(bt, ot, strike_pct, tenor, r, notional,
+                  barrier_mode, barrier_level, barrier_obs,
+                  autocall, ac_freq, ac_trigger, int(ac_first))
 
-st.subheader(f"2 · {position} the {trade_name}: price & risk")
-if not st.button(f"▶ Price the {trade_name}", type="primary",
-                 use_container_width=True):
+st.subheader(f"2 · {position} the {trade_full}")
+if not st.button(f"▶ Price it", type="primary", use_container_width=True):
     st.info("Adjust terms in the sidebar, then price.")
     st.stop()
 
@@ -791,74 +1003,84 @@ with st.spinner(f"Simulating {n_paths:,} Heston paths…"):
                               n_paths=int(n_paths), seed=int(seed),
                               greeks=do_greeks)
 
-bs_ref = bs_basket_option(bt, ot, 1.0, 1.0, strike_pct, tenor, r,
-                          assets[0].div_yield, assets[1].div_yield,
-                          float(np.sqrt(assets[0].theta)),
-                          float(np.sqrt(assets[1].theta)), rho_s) * 100
-
 driver = "worst performer" if bt == "worst" else "best performer"
 prem_word = "receive" if selling else "pay"
 
-m = st.columns(5)
-m[0].metric(f"Premium you {prem_word}", f"{res.premium_pct:.2f}%",
-            f"± {2*res.stderr_pct:.2f}% (95% CI)")
-m[1].metric("Premium in cash", f"${res.premium_cash:,.0f}",
-            f"on ${notional:,.0f}")
-m[2].metric("P(exercise)", f"{res.prob_itm:.1%}",
-            f"{driver} {'<' if ot=='put' else '>'} {strike_pct:.0%}",
-            delta_color="off")
-m[3].metric("E[payout] if exercised", f"{res.exp_payoff_given_itm:.1f}%",
-            "of notional", delta_color="off")
-m[4].metric("Breakeven level", f"{res.breakeven_agg:.1%}",
-            f"of initial ({driver})", delta_color="off")
+metrics = [
+    (f"Premium you {prem_word}", f"{res.premium_pct:.2f}%",
+     f"± {2*res.stderr_pct:.2f}%"),
+    ("Premium in cash", money(res.premium_cash), f"on {money(notional)}"),
+    ("P(exercise)", f"{res.prob_itm:.1%}", None),
+    ("Breakeven level", f"{res.breakeven_agg:.0%}", f"final {driver}"),
+    ("E[payout] if exercised", f"{res.exp_payoff_given_itm:.1f}%",
+     "of notional"),
+    ("Tail payout (CVaR 95)", f"{res.cvar95_payoff_pct:.1f}%",
+     "worst 5% avg"),
+    (f"P({tickers[0]} drives | ITM)", f"{res.prob_driver_is[0]:.0%}", None),
+    ("Annualized premium", f"{res.premium_pct/tenor:.2f}%", "p.a."),
+]
+if barrier_mode != "none":
+    metrics.append((f"P({b_mode_lbl.lower()} event)",
+                    f"{res.prob_barrier_event:.1%}",
+                    f"barrier {barrier_level:.0%}"))
+if autocall:
+    metrics += [
+        ("P(autocalled early)", f"{res.prob_autocall.sum():.1%}", None),
+        ("Expected life", f"{res.exp_life_years:.2f}y",
+         f"of {tenor:.2f}y max"),
+        ("Coupon this funds", f"{res.fair_coupon_pa:.2f}%",
+         "p.a. while alive"),
+    ]
+else:
+    bs_ref = bs_basket_option(bt, ot, 1.0, 1.0, strike_pct, tenor, r,
+                              assets[0].div_yield, assets[1].div_yield,
+                              float(np.sqrt(assets[0].theta)),
+                              float(np.sqrt(assets[1].theta)), rho_s) * 100
+    if barrier_mode == "none":
+        metrics.append(("Heston vs flat-vol", f"{res.premium_pct-bs_ref:+.2f}%",
+                        f"BS ref {bs_ref:.2f}%"))
 
-m = st.columns(5)
-m[0].metric("95% tail payout (CVaR)", f"{res.cvar95_payoff_pct:.1f}%",
-            "avg of worst 5% for the seller", delta_color="off")
-m[1].metric("Max simulated payout", f"{res.max_payoff_pct:.1f}%", delta_color="off")
-m[2].metric(f"P({tickers[0]} drives it | ITM)",
-            f"{res.prob_driver_is[0]:.0%}")
-m[3].metric("Heston vs flat-vol", f"{res.premium_pct - bs_ref:+.2f}%",
-            f"BS/Stulz ref {bs_ref:.2f}%", delta_color="off")
-m[4].metric("Annualized premium", f"{res.premium_pct/tenor:.2f}% p.a.")
+for row_start in range(0, len(metrics), 4):
+    row = metrics[row_start:row_start + 4]
+    cols = st.columns(4)
+    for c, (lbl, val, dl) in zip(cols, row):
+        c.metric(lbl, val, dl, delta_color="off")
 
 if selling:
-    msg = (f"You collect <b>${res.premium_cash:,.0f}</b> today. In "
-           f"{res.prob_itm:.0%} of paths the {driver} finishes "
-           f"{'below' if ot=='put' else 'above'} {strike_pct:.0%} and you pay "
-           f"the difference — averaging {res.exp_payoff_given_itm:.1f}% of "
-           f"notional when exercised. You stay profitable while the {driver} "
-           f"stays {'above' if ot=='put' else 'below'} "
-           f"<b>{res.breakeven_agg:.1%}</b>.")
+    msg = (f"You collect <b>{money(res.premium_cash)}</b> today. The option is "
+           f"exercised in {res.prob_itm:.0%} of paths, costing "
+           f"{res.exp_payoff_given_itm:.1f}% of notional on average when it "
+           f"happens.")
+    if autocall:
+        msg += (f" With autocall, the structure ends early in "
+                f"{res.prob_autocall.sum():.0%} of paths (expected life "
+                f"{res.exp_life_years:.2f}y) — this premium would fund a "
+                f"coupon of about <b>{res.fair_coupon_pa:.2f}% p.a.</b> on an "
+                f"equivalent autocallable note.")
 else:
-    msg = (f"You pay <b>${res.premium_cash:,.0f}</b> today. The option pays "
+    msg = (f"You pay <b>{money(res.premium_cash)}</b> today; the option pays "
            f"off in {res.prob_itm:.0%} of paths, averaging "
-           f"{res.exp_payoff_given_itm:.1f}% of notional when it does. You "
-           f"profit if the {driver} finishes "
-           f"{'below' if ot=='put' else 'above'} <b>{res.breakeven_agg:.1%}</b>.")
+           f"{res.exp_payoff_given_itm:.1f}% of notional when it does.")
 st.markdown(f"<div class='note-box'>{msg}</div>", unsafe_allow_html=True)
 
 if do_greeks:
-    st.markdown(f"**Greeks (per 100 notional, from your side as {position.lower()}er)**")
-    your = -sgn  # seller is short the option's sensitivities
-    gdf = pd.DataFrame({
-        "Sensitivity": [f"Delta {tickers[0]} (+1% spot)",
-                        f"Delta {tickers[1]} (+1% spot)",
-                        f"Vega {tickers[0]} (+1 vol pt)",
-                        f"Vega {tickers[1]} (+1 vol pt)",
-                        "Correlation (+0.05)"],
-        "Option value": [f"{res.deltas[0]:+.3f}", f"{res.deltas[1]:+.3f}",
-                         f"{res.vegas[0]:+.3f}", f"{res.vegas[1]:+.3f}",
-                         f"{res.corr_sens:+.3f}"],
-        "Your P&L": [f"{your*res.deltas[0]:+.3f}", f"{your*res.deltas[1]:+.3f}",
-                     f"{your*res.vegas[0]:+.3f}", f"{your*res.vegas[1]:+.3f}",
-                     f"{your*res.corr_sens:+.3f}"]})
-    st.dataframe(gdf, hide_index=True, use_container_width=True)
-    corr_note = ("Worst-of options lose value as correlation rises (the basket "
-                 "behaves more like one stock); best-of options gain from "
-                 "dispersion the opposite way. Whoever is short the option is "
-                 "on the other side of that correlation exposure.")
-    st.caption(corr_note)
+    with st.expander("Greeks (per 100 notional)", expanded=True):
+        your = -sgn
+        gdf = pd.DataFrame({
+            "Sensitivity": [f"Delta {tickers[0]} (+1% spot)",
+                            f"Delta {tickers[1]} (+1% spot)",
+                            f"Vega {tickers[0]} (+1 vol pt)",
+                            f"Vega {tickers[1]} (+1 vol pt)",
+                            "Correlation (+0.05)"],
+            "Option value": [f"{res.deltas[0]:+.3f}", f"{res.deltas[1]:+.3f}",
+                             f"{res.vegas[0]:+.3f}", f"{res.vegas[1]:+.3f}",
+                             f"{res.corr_sens:+.3f}"],
+            "Your P&L": [f"{your*res.deltas[0]:+.3f}",
+                         f"{your*res.deltas[1]:+.3f}",
+                         f"{your*res.vegas[0]:+.3f}",
+                         f"{your*res.vegas[1]:+.3f}",
+                         f"{your*res.corr_sens:+.3f}"]})
+        st.dataframe(gdf, hide_index=True, use_container_width=True)
 
 # --------------------------------------------------------------------- charts
 your_pnl = sgn * res.seller_pnl_pct
@@ -869,76 +1091,112 @@ with cA:
     fig.add_vline(x=0, line_dash="dash", line_color=GRAY)
     fig.add_vline(x=float(np.mean(your_pnl)), line_color=GREEN,
                   annotation_text=f"mean {np.mean(your_pnl):+.1f}%")
-    fig.update_layout(title=f"Your P&L at maturity ({position.lower()}er, % of "
-                            f"notional, premium accrued)",
-                      height=330, margin=dict(l=10, r=10, t=45, b=10),
+    fig.update_layout(title=f"Your P&L at maturity ({position.lower()}er, % "
+                            f"of notional)", height=320,
+                      margin=dict(l=10, r=10, t=45, b=10),
                       xaxis_title="P&L %", yaxis_title="Paths")
     st.plotly_chart(fig, use_container_width=True)
 
 with cB:
     x = np.linspace(0.05, 1.9, 300)
     prem_T = res.premium_pct / np.exp(-r * tenor) / 100
-    opt_pay = np.maximum(strike_pct - x, 0) if ot == "put" \
-        else np.maximum(x - strike_pct, 0)
-    pnl = sgn * (prem_T - opt_pay) * 100
-    fig = go.Figure(go.Scatter(x=x * 100, y=pnl,
-                               line=dict(color=ACCENT, width=2.5)))
+    opt_pay = (np.maximum(strike_pct - x, 0) if ot == "put"
+               else np.maximum(x - strike_pct, 0))
+    fig = go.Figure()
+    if barrier_mode == "ki":
+        fig.add_trace(go.Scatter(x=x*100, y=sgn*prem_T*100*np.ones_like(x),
+                                 name="barrier never hit",
+                                 line=dict(color=GREEN, width=2)))
+        fig.add_trace(go.Scatter(x=x*100, y=sgn*(prem_T-opt_pay)*100,
+                                 name="knocked in",
+                                 line=dict(color=RED, width=2, dash="dash")))
+    elif barrier_mode == "ko":
+        fig.add_trace(go.Scatter(x=x*100, y=sgn*(prem_T-opt_pay)*100,
+                                 name="never knocked out",
+                                 line=dict(color=ACCENT, width=2)))
+        fig.add_trace(go.Scatter(x=x*100, y=sgn*prem_T*100*np.ones_like(x),
+                                 name="knocked out",
+                                 line=dict(color=GREEN, width=2, dash="dash")))
+    else:
+        fig.add_trace(go.Scatter(x=x*100, y=sgn*(prem_T-opt_pay)*100,
+                                 showlegend=False,
+                                 line=dict(color=ACCENT, width=2.5)))
     fig.add_hline(y=0, line_color=GRAY, line_width=1)
-    fig.add_vline(x=strike_pct * 100, line_dash="dot", line_color=AMBER,
+    fig.add_vline(x=strike_pct*100, line_dash="dot", line_color=AMBER,
                   annotation_text="strike")
-    fig.add_vline(x=res.breakeven_agg * 100, line_dash="dot", line_color=RED,
-                  annotation_text="breakeven")
-    fig.update_layout(title=f"Payoff diagram vs final {driver}",
-                      height=330, margin=dict(l=10, r=10, t=45, b=10),
+    if barrier_mode != "none":
+        fig.add_vline(x=barrier_level*100, line_dash="dot", line_color=RED,
+                      annotation_text="barrier")
+    fig.update_layout(title=f"Payoff at maturity vs final {driver}",
+                      height=320, margin=dict(l=10, r=10, t=45, b=10),
                       xaxis_title=f"Final {driver} (% of initial)",
-                      yaxis_title="Your P&L (% of notional)")
+                      yaxis_title="Your P&L (% of notional)",
+                      legend=dict(x=0.02, y=0.98))
     st.plotly_chart(fig, use_container_width=True)
 
 cA, cB = st.columns(2)
 with cA:
     if res.sample_paths is not None:
+        n_show = min(120, res.sample_paths.shape[0])
+        n_steps = res.sample_paths.shape[1] - 1
         fig = go.Figure()
-        for i in range(min(130, res.sample_paths.shape[0])):
+        for i in range(n_show):
+            called = res.sample_exit_step[i] < n_steps
             end = res.sample_paths[i, -1]
-            itm = (end < strike_pct) if ot == "put" else (end > strike_pct)
-            fig.add_trace(go.Scatter(
-                x=res.time_grid, y=res.sample_paths[i] * 100, mode="lines",
-                line=dict(width=0.8,
-                          color=RED if itm else "rgba(75,139,196,0.30)"),
-                showlegend=False, hoverinfo="skip"))
-        fig.add_hline(y=strike_pct * 100, line_dash="dot", line_color=AMBER,
+            itm = ((end < strike_pct) if ot == "put"
+                   else (end > strike_pct)) and not called
+            color = (GREEN if called else
+                     RED if itm else "rgba(75,139,196,0.28)")
+            fig.add_trace(go.Scatter(x=res.time_grid,
+                                     y=res.sample_paths[i]*100, mode="lines",
+                                     line=dict(width=0.8, color=color),
+                                     showlegend=False, hoverinfo="skip"))
+        fig.add_hline(y=strike_pct*100, line_dash="dot", line_color=AMBER,
                       annotation_text="strike", annotation_position="right")
-        fig.update_layout(title=f"Sample {driver} paths (red = exercised)",
-                          height=330, margin=dict(l=10, r=10, t=45, b=10),
+        if barrier_mode != "none":
+            fig.add_hline(y=barrier_level*100, line_dash="dot",
+                          line_color=RED, annotation_text="barrier",
+                          annotation_position="right")
+        if autocall:
+            fig.add_hline(y=ac_trigger*100, line_dash="dot", line_color=GREEN,
+                          annotation_text="autocall",
+                          annotation_position="right")
+        fig.update_layout(title=f"Sample {driver} paths (red = exercised"
+                                + (", green = autocalled)" if autocall else ")"),
+                          height=320, margin=dict(l=10, r=10, t=45, b=10),
                           xaxis_title="Years",
                           yaxis_title=f"{basket_type} level (% of initial)")
         st.plotly_chart(fig, use_container_width=True)
 
 with cB:
-    fig = go.Figure(go.Histogram2d(
-        x=res.perf_T[:, 0] * 100, y=res.perf_T[:, 1] * 100,
-        nbinsx=60, nbinsy=60, colorscale="Blues"))
-    fig.add_vline(x=strike_pct * 100, line_dash="dot", line_color=RED)
-    fig.add_hline(y=strike_pct * 100, line_dash="dot", line_color=RED)
-    if bt == "worst" and ot == "put":
-        region = "either stock below its line (L-shape)"
-    elif bt == "worst" and ot == "call":
-        region = "both stocks above their lines (top-right box)"
-    elif bt == "best" and ot == "call":
-        region = "either stock above its line (reverse L)"
+    if autocall and len(res.obs_times):
+        labels = [f"{t:.2f}y" for t in res.obs_times]
+        surv = 1.0 - res.prob_autocall.sum()
+        fig = go.Figure(go.Bar(x=labels + ["Maturity"],
+                               y=list(res.prob_autocall*100) + [surv*100],
+                               marker_color=[GREEN]*len(labels) + [GRAY]))
+        fig.update_layout(title="When does the structure end? (%)",
+                          height=320, margin=dict(l=10, r=10, t=45, b=10),
+                          yaxis_title="% of paths")
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        region = "both stocks below their lines (bottom-left box)"
-    fig.update_layout(title=f"Joint final performance — exercised when {region}",
-                      height=330, margin=dict(l=10, r=10, t=45, b=10),
-                      xaxis_title=f"{tickers[0]} final (%)",
-                      yaxis_title=f"{tickers[1]} final (%)")
-    st.plotly_chart(fig, use_container_width=True)
+        fig = go.Figure(go.Histogram2d(x=res.perf_T[:, 0]*100,
+                                       y=res.perf_T[:, 1]*100,
+                                       nbinsx=60, nbinsy=60,
+                                       colorscale="Blues"))
+        fig.add_vline(x=strike_pct*100, line_dash="dot", line_color=RED)
+        fig.add_hline(y=strike_pct*100, line_dash="dot", line_color=RED)
+        fig.update_layout(title="Joint final performance",
+                          height=320, margin=dict(l=10, r=10, t=45, b=10),
+                          xaxis_title=f"{tickers[0]} final (%)",
+                          yaxis_title=f"{tickers[1]} final (%)")
+        st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("""
-<div class='warn-box'><b>Model Limitations.</b> With option-implied
-calibration the single-name smiles are market-consistent, but the <i>correlation</i>
-input is still historical — implied correlation from listed products typically
-trades above realized, and correlation spikes in sell-offs. Constant rho between
-the stocks, European exercise, flat rates, no credit/funding adjustments, and
-discrete dividends approximated by a continuous yield. Educational tool, not
-investment advice.</div>""", unsafe_allow_html=True)
+<div class='warn-box'><b>Remaining model limitations.</b> Single-name smiles are
+market-consistent under implied calibration, but the correlation input is
+historical — implied correlation typically trades above realized and spikes in
+sell-offs. Continuous barriers use a Brownian-bridge correction where the event
+is "either stock crosses" (worst-of down, best-of up); "both stocks" events use
+daily monitoring. European exercise, flat rates, no credit/funding adjustments.
+Educational tool, not investment advice.</div>""", unsafe_allow_html=True)
