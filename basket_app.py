@@ -11,7 +11,7 @@ Run locally:  streamlit run basket_app.py
 Self-test:    python basket_app.py --selftest
 """
 
-APP_VERSION = "3.0 barriers + autocall"
+APP_VERSION = "3.1 vol/dividend fixes"
 
 import sys
 import time
@@ -305,10 +305,17 @@ def calibrate_heston(quotes: List[Tuple[float, float, float]],
     sol = least_squares(resid, p0, bounds=(lb, ub), x_scale=np.array(
         [0.1, 2.0, 0.1, 0.5, 0.5]), xtol=1e-10, ftol=1e-10, max_nfev=max_nfev)
     v0, ka, th, xi_, rho = sol.x
+    # Post-fit Feller guard: a calibrator can trade off a huge xi against theta
+    # to shave listed-strike error while wrecking the deep-OTM wing that a 70%
+    # worst-of put depends on. Cap xi to keep 2*kappa*theta/xi^2 >= 0.4.
+    feller = 2.0 * ka * th / max(xi_**2, 1e-12)
+    if feller < 0.4:
+        xi_ = float(np.sqrt(2.0 * ka * th / 0.4))
     return {"v0": float(v0), "kappa": float(ka), "theta": float(th),
             "xi": float(xi_), "rho_sv": float(rho),
             "rmse_iv": float(np.sqrt(np.mean(sol.fun**2))),
-            "n_quotes": n, "nfev": int(sol.nfev)}
+            "n_quotes": n, "nfev": int(sol.nfev),
+            "feller": float(2.0 * ka * th / max(xi_**2, 1e-12))}
 
 
 def model_smile(S0, r, q, T, strikes, v0, kappa, theta, xi, rho) -> np.ndarray:
@@ -338,10 +345,16 @@ def estimate_heston_from_returns(log_returns: np.ndarray,
     dt = 1.0 / trading_days
     dv, x = np.diff(rv), theta - rv[:-1]
     den = float(x @ x)
-    kappa = float(np.clip((x @ dv) / (den * dt) if den > 0 else 2.0, 0.3, 10.0))
+    # kappa from AR(1); cap at 6 (10 just means we fit RV noise, not reversion)
+    kappa = float(np.clip((x @ dv) / (den * dt) if den > 0 else 2.0, 0.5, 6.0))
     resid = dv - kappa * x * dt
     xi = float(np.clip(np.std(resid, ddof=1)
-                       / (np.sqrt(rv[:-1].mean()) * np.sqrt(dt)), 0.10, 2.5))
+                       / (np.sqrt(rv[:-1].mean()) * np.sqrt(dt)), 0.10, 1.5))
+    # Feller guard: keep 2*kappa*theta/xi^2 >= 0.5 so variance stays well-behaved
+    # and deep-OTM tails are not artificially fattened by an oversized xi.
+    feller = 2.0 * kappa * theta / max(xi**2, 1e-12)
+    if feller < 0.5:
+        xi = float(np.sqrt(2.0 * kappa * theta / 0.5))
     dr = lr[win - 1:][1:n]
     rho = -0.6
     if dr.size == dv.size and dv.size > 10:
@@ -638,6 +651,20 @@ def _selftest():
           f"{'OK' if pa2.premium_pct < pv.premium_pct else 'FAIL'}")
     assert pa2.premium_pct < pv.premium_pct and pi.premium_pct < pv.premium_pct
 
+    # 5) clean flat-vol worst-of put matches closed form (guards don't distort)
+    aM = Asset("MSFT", 500.0, 0.007, v0=0.25**2, kappa=1.5, theta=0.25**2,
+               xi=1e-4, rho_sv=-0.5)
+    aT = Asset("TSLA", 320.0, 0.0, v0=0.55**2, kappa=1.5, theta=0.55**2,
+               xi=1e-4, rho_sv=-0.5)
+    sp = OptionSpec("worst", "put", 0.70, 1.0, 0.04)
+    rr = price_basket_option(aM, aT, 0.45, sp, n_paths=120_000, seed=1,
+                             n_saved=0, greeks=False)
+    an = bs_basket_option("worst", "put", 1.0, 1.0, 0.70, 1.0, 0.04,
+                          0.007, 0.0, 0.25, 0.55, 0.45) * 100
+    ok = abs(rr.premium_pct - an) < 0.25
+    print(f"clean MSFT/TSLA worst-of put: MC={rr.premium_pct:.2f}% "
+          f"closed-form={an:.2f}%  {'OK' if ok else 'FAIL'}")
+    assert ok
     print(f"basket_app v{APP_VERSION}: all self-tests passed.")
 
 
@@ -704,6 +731,36 @@ st.caption(f"Worst-of / best-of · calls & puts · optional barriers & autocall 
            f"Heston MC calibrated to implied vols · v{APP_VERSION}")
 
 # ----------------------------------------------------------------- data layer
+
+def _robust_div_yield(tk, spot: float) -> float:
+    """Continuous dividend yield, robust to yfinance unit changes.
+
+    Primary: trailing-12M cash dividends / spot — unit-unambiguous.
+    Fallback: parse info['dividendYield'], which has flipped between decimal
+    (0.007) and percent (0.7) across yfinance versions; interpret defensively.
+    Either way, clamp to [0, 12%] — no large-cap equity yields more, and an
+    absurd q silently destroys every option price downstream.
+    """
+    try:
+        d = tk.dividends
+        if d is not None and len(d):
+            d = d[d.index >= (d.index.max() - pd.Timedelta(days=365))]
+            y = float(d.sum()) / spot
+            if 0.0 <= y < 0.20:
+                return min(y, 0.12)
+    except Exception:
+        pass
+    try:
+        y = float(tk.info.get("dividendYield", 0.0) or 0.0)
+        if y > 1.0:
+            y /= 100.0
+        if y > 0.12:          # 0.7 almost certainly means 0.7%, not 70%
+            y /= 100.0
+        return float(min(max(y, 0.0), 0.12))
+    except Exception:
+        return 0.0
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_hist(tickers: tuple, lookback: str):
     import yfinance as yf
@@ -717,17 +774,20 @@ def fetch_hist(tickers: tuple, lookback: str):
     lr = np.log(px / px.shift(1)).dropna()
     divs = {}
     for t in tickers:
-        try:
-            y = yf.Ticker(t).info.get("dividendYield", 0.0) or 0.0
-            divs[t] = float(y) if y < 1 else float(y) / 100.0
-        except Exception:
-            divs[t] = 0.0
+        divs[t] = _robust_div_yield(yf.Ticker(t), float(px[t].iloc[-1]))
     return px, lr, float(lr.corr().iloc[0, 1]), divs
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_option_quotes(ticker: str, spot: float, tenor: float):
-    """OTM implied-vol quotes from two expiries bracketing the tenor."""
+def fetch_option_quotes(ticker: str, spot: float, tenor: float,
+                        r: float, q: float):
+    """OTM option quotes from two expiries bracketing the tenor.
+
+    Implied vols are RECOMPUTED from bid/ask mid prices with the correct
+    (r, q) — Yahoo's own impliedVolatility column is often stale or computed
+    off last trades, and quietly inflates the wings. Liquidity filters: bid>0,
+    relative spread <= 60%, recomputed IV in (3%, 200%).
+    """
     import datetime as dtm
     import yfinance as yf
     tk = yf.Ticker(ticker)
@@ -747,27 +807,36 @@ def fetch_option_quotes(ticker: str, spot: float, tenor: float):
         ch = tk.option_chain(e)
         for df, side in ((ch.puts, "put"), (ch.calls, "call")):
             df = df.copy()
-            df = df[(df["impliedVolatility"] > 0.02)
-                    & (df["impliedVolatility"] < 4.0)]
             if side == "put":
-                df = df[(df["strike"] >= 0.45 * spot) & (df["strike"] <= spot)]
+                df = df[(df["strike"] >= 0.50 * spot)
+                        & (df["strike"] <= spot)]
             else:
-                df = df[(df["strike"] > spot) & (df["strike"] <= 1.5 * spot)]
+                df = df[(df["strike"] > spot)
+                        & (df["strike"] <= 1.45 * spot)]
+            if "bid" in df and "ask" in df:
+                df = df[(df["bid"] > 0) & (df["ask"] >= df["bid"])]
+                df["mid"] = 0.5 * (df["bid"] + df["ask"])
+                df = df[(df["ask"] - df["bid"]) <= 0.6 * df["mid"]]
+            else:
+                df["mid"] = df["lastPrice"]
+                df = df[df["mid"] > 0]
             df = df.sort_values("strike")
             if len(df) > 6:
                 df = df.iloc[np.linspace(0, len(df) - 1, 6).astype(int)]
             for _, row in df.iterrows():
-                quotes.append((float(T), float(row["strike"]),
-                               float(row["impliedVolatility"])))
+                iv = implied_vol(float(row["mid"]), spot,
+                                 float(row["strike"]), T, r, q, side)
+                if np.isfinite(iv) and 0.03 < iv < 2.0:
+                    quotes.append((float(T), float(row["strike"]), float(iv)))
     if len(quotes) < 5:
-        raise ValueError("Too few usable option quotes.")
+        raise ValueError("Too few liquid option quotes after filtering.")
     return quotes
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_calibrate(ticker: str, spot: float, tenor: float, r: float,
                      q: float, x0: dict):
-    quotes = fetch_option_quotes(ticker, spot, tenor)
+    quotes = fetch_option_quotes(ticker, spot, tenor, r, q)
     fit = calibrate_heston(quotes, spot, r, q, x0)
     return fit, quotes
 
@@ -929,6 +998,9 @@ for i, t in enumerate(tickers):
         st.markdown(f"**{t}** · spot **{spots[t]:,.2f}** · strike "
                     f"**{spots[t]*strike_pct:,.2f}** ({strike_pct:.0%})")
         st.caption(f"Calibration: {source}")
+        st.caption(f"√v₀ {np.sqrt(est['v0']):.0%} · √θ "
+                   f"{np.sqrt(est['theta']):.0%} · div yield "
+                   f"{divs.get(t, 0.0):.2%}  ← sanity-check these")
         with st.expander(f"Heston parameters — {t}", expanded=False):
             v0 = st.number_input("v₀", 0.0001, 4.0, float(round(est["v0"], 4)),
                                  format="%.4f", key=f"v0{i}")
