@@ -11,7 +11,7 @@ Run locally:  streamlit run basket_app.py
 Self-test:    python basket_app.py --selftest
 """
 
-APP_VERSION = "3.1 vol/dividend fixes"
+APP_VERSION = "3.2 after-hours quotes + widget-state fix"
 
 import sys
 import time
@@ -778,16 +778,44 @@ def fetch_hist(tickers: tuple, lookback: str):
     return px, lr, float(lr.corr().iloc[0, 1]), divs
 
 
+def _rows_to_quotes(df, side, spot, T, r, q):
+    """Convert option-chain rows to (T, K, iv) quotes, robust to market hours.
+
+    Price source, in order of trust:
+      1. bid/ask mid, when both sides are live and the spread is sane
+      2. lastPrice, when there is evidence of trading (volume or OI)
+         — outside US market hours Yahoo returns bid=ask=0 on EVERY contract,
+           so a bid>0 requirement silently kills the whole chain
+      3. Yahoo's impliedVolatility column, only if price inversion failed
+    """
+    quotes = []
+    for _, row in df.iterrows():
+        k = float(row["strike"])
+        bid = float(row.get("bid", 0) or 0)
+        ask = float(row.get("ask", 0) or 0)
+        last = float(row.get("lastPrice", 0) or 0)
+        traded = (float(row.get("volume", 0) or 0) > 0
+                  or float(row.get("openInterest", 0) or 0) > 0)
+        mid = None
+        if bid > 0 and ask >= bid and (ask - bid) <= 0.6 * 0.5 * (bid + ask):
+            mid = 0.5 * (bid + ask)
+        elif last > 0 and traded:
+            mid = last
+        if mid is None:
+            continue
+        iv = implied_vol(mid, spot, k, T, r, q, side)
+        if not (np.isfinite(iv) and 0.03 < iv < 2.0):
+            yiv = float(row.get("impliedVolatility", np.nan) or np.nan)
+            iv = yiv if (np.isfinite(yiv) and 0.05 < yiv < 1.8) else np.nan
+        if np.isfinite(iv):
+            quotes.append((float(T), k, float(iv)))
+    return quotes
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_option_quotes(ticker: str, spot: float, tenor: float,
                         r: float, q: float):
-    """OTM option quotes from two expiries bracketing the tenor.
-
-    Implied vols are RECOMPUTED from bid/ask mid prices with the correct
-    (r, q) — Yahoo's own impliedVolatility column is often stale or computed
-    off last trades, and quietly inflates the wings. Liquidity filters: bid>0,
-    relative spread <= 60%, recomputed IV in (3%, 200%).
-    """
+    """OTM option quotes from two expiries bracketing the tenor."""
     import datetime as dtm
     import yfinance as yf
     tk = yf.Ticker(ticker)
@@ -802,34 +830,25 @@ def fetch_option_quotes(ticker: str, spot: float, tenor: float,
         e = min(exps, key=lambda x: abs(x[1] - target))
         if e not in chosen:
             chosen.append(e)
-    quotes = []
+    quotes, n_raw = [], 0
     for e, T in chosen:
         ch = tk.option_chain(e)
         for df, side in ((ch.puts, "put"), (ch.calls, "call")):
             df = df.copy()
             if side == "put":
-                df = df[(df["strike"] >= 0.50 * spot)
-                        & (df["strike"] <= spot)]
+                df = df[(df["strike"] >= 0.50 * spot) & (df["strike"] <= spot)]
             else:
-                df = df[(df["strike"] > spot)
-                        & (df["strike"] <= 1.45 * spot)]
-            if "bid" in df and "ask" in df:
-                df = df[(df["bid"] > 0) & (df["ask"] >= df["bid"])]
-                df["mid"] = 0.5 * (df["bid"] + df["ask"])
-                df = df[(df["ask"] - df["bid"]) <= 0.6 * df["mid"]]
-            else:
-                df["mid"] = df["lastPrice"]
-                df = df[df["mid"] > 0]
+                df = df[(df["strike"] > spot) & (df["strike"] <= 1.45 * spot)]
             df = df.sort_values("strike")
-            if len(df) > 6:
-                df = df.iloc[np.linspace(0, len(df) - 1, 6).astype(int)]
-            for _, row in df.iterrows():
-                iv = implied_vol(float(row["mid"]), spot,
-                                 float(row["strike"]), T, r, q, side)
-                if np.isfinite(iv) and 0.03 < iv < 2.0:
-                    quotes.append((float(T), float(row["strike"]), float(iv)))
+            n_raw += len(df)
+            if len(df) > 8:
+                df = df.iloc[np.linspace(0, len(df) - 1, 8).astype(int)]
+            quotes += _rows_to_quotes(df, side, spot, T, r, q)
     if len(quotes) < 5:
-        raise ValueError("Too few liquid option quotes after filtering.")
+        raise ValueError(
+            f"only {len(quotes)} usable quotes from {n_raw} contracts — "
+            f"if the market is closed, Yahoo often returns empty bid/ask "
+            f"AND zero volume; try again during US market hours")
     return quotes
 
 
@@ -952,12 +971,12 @@ if not data_ok:
     for i, t in enumerate(tickers):
         with c[i]:
             st.markdown(f"**{t}**")
-            spots[t] = st.number_input(f"Spot {t}", 0.01, 1e6, 100.0, key=f"s{i}")
+            spots[t] = st.number_input(f"Spot {t}", 0.01, 1e6, 100.0, key=f"s_{t}")
             vols[t] = st.number_input(f"Vol {t} (% p.a.)", 1.0, 300.0,
                                       45.0 if i == 0 else 55.0,
-                                      key=f"v{i}") / 100
+                                      key=f"v_{t}") / 100
             divs[t] = st.number_input(f"Div yield {t} (%)", 0.0, 20.0, 0.0,
-                                      key=f"d{i}") / 100
+                                      key=f"d_{t}") / 100
     rho_hist = st.slider("Spot correlation", -0.5, 0.99, 0.55, 0.01)
     hist, lr = None, None
 
@@ -1001,18 +1020,19 @@ for i, t in enumerate(tickers):
         st.caption(f"√v₀ {np.sqrt(est['v0']):.0%} · √θ "
                    f"{np.sqrt(est['theta']):.0%} · div yield "
                    f"{divs.get(t, 0.0):.2%}  ← sanity-check these")
+        sig = f"{t}_{est['v0']:.4f}_{est['theta']:.4f}_{est['xi']:.2f}"
         with st.expander(f"Heston parameters — {t}", expanded=False):
             v0 = st.number_input("v₀", 0.0001, 4.0, float(round(est["v0"], 4)),
-                                 format="%.4f", key=f"v0{i}")
+                                 format="%.4f", key=f"v0_{sig}")
             th = st.number_input("θ", 0.0001, 4.0,
                                  float(round(est["theta"], 4)),
-                                 format="%.4f", key=f"th{i}")
+                                 format="%.4f", key=f"th_{sig}")
             ka = st.number_input("κ", 0.05, 15.0,
-                                 float(round(est["kappa"], 2)), key=f"ka{i}")
+                                 float(round(est["kappa"], 2)), key=f"ka_{sig}")
             xv = st.number_input("ξ (vol of vol)", 0.01, 3.0,
-                                 float(round(est["xi"], 2)), key=f"xi{i}")
+                                 float(round(est["xi"], 2)), key=f"xi_{sig}")
             rh = st.number_input("ρ spot-vol", -0.99, 0.5,
-                                 float(round(est["rho_sv"], 2)), key=f"rh{i}")
+                                 float(round(est["rho_sv"], 2)), key=f"rh_{sig}")
         st.caption(f"√v₀ = {np.sqrt(v0):.1%} · √θ = {np.sqrt(th):.1%}")
         assets.append(Asset(t, spots[t], divs.get(t, 0.0), v0, ka, th, xv, rh))
 
