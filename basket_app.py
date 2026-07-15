@@ -718,10 +718,20 @@ def fetch_hist(tickers: tuple, lookback: str):
     divs = {}
     for t in tickers:
         try:
-            y = yf.Ticker(t).info.get("dividendYield", 0.0) or 0.0
-            divs[t] = float(y) if y < 1 else float(y) / 100.0
+            y = yf.Ticker(t).info.get("dividendYield", None)
+
+            if y is None:
+            y = 0.0
+            y = float(y)
+            # Convert anything larger than 10% into a percentage.
+            if y > 0.10:
+            y /= 100.0
+            divs[t] = y
+            print(f"{t}: dividend yield = {divs[t]:.4%}")
+
         except Exception:
             divs[t] = 0.0
+            
     return px, lr, float(lr.corr().iloc[0, 1]), divs
 
 
