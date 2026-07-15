@@ -721,14 +721,15 @@ def fetch_hist(tickers: tuple, lookback: str):
             y = yf.Ticker(t).info.get("dividendYield", None)
 
             if y is None:
-            y = 0.0
+                y = 0.0
             y = float(y)
             # Convert anything larger than 10% into a percentage.
             if y > 0.10:
-            y /= 100.0
+                y /= 100.0
+                
             divs[t] = y
             print(f"{t}: dividend yield = {divs[t]:.4%}")
-
+    
         except Exception:
             divs[t] = 0.0
             
