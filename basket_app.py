@@ -163,35 +163,78 @@ def bs_basket_option(basket_type, option_type, S1, S2, K, T, r,
 # Heston vanilla pricer (characteristic function) + implied vol + calibration
 # -----------------------------------------------------------------------------
 
-def _heston_cf_probs(u, wq, E, S0, K, T, r, q, v0, kappa, theta, xi, rho):
+def _heston_cf_probs(u, wq, E, S0, K, T, r, q,
+                     v0, kappa, theta, xi, rho):
     """
-    Vectorized Heston P1, P2 for a VECTOR of strikes at ONE maturity.
+    Stable Little-Heston-Trap implementation.
 
-    Key speed insight: the characteristic function does not depend on the
-    strike — only the Fourier factor exp(-i*u*ln K) does. So the CF is
-    evaluated once per maturity (a length-n_quad vector) and all strikes are
-    obtained with a single matrix product against a PRE-COMPUTED E matrix.
-    This removes the O(n_strikes) inner loop that dominated calibration.
-
-    E : (n_strikes, n_quad) complex array = exp(-i*u*lnK) / (i*u)
+    Returns vectorized P1 and P2.
     """
+
     P = []
+
     for j in (1, 2):
-        a = kappa * theta
+
         if j == 1:
-            uu, b = 0.5, kappa - rho * xi
+            u_j = 0.5
+            b = kappa - rho * xi
         else:
-            uu, b = -0.5, kappa
+            u_j = -0.5
+            b = kappa
+
         iu = 1j * u
-        d = np.sqrt((rho * xi * iu - b) ** 2 - xi**2 * (2 * uu * iu - u**2))
-        g = (b - rho * xi * iu + d) / (b - rho * xi * iu - d)
-        ed = np.exp(d * T)
-        C = (r - q) * iu * T + a / xi**2 * (
-            (b - rho * xi * iu + d) * T - 2.0 * np.log((1 - g * ed) / (1 - g)))
-        D = (b - rho * xi * iu + d) / xi**2 * (1 - ed) / (1 - g * ed)
-        cf = np.exp(C + D * v0 + iu * np.log(S0))          # (n_quad,)
-        integ = np.real(E * cf[None, :])                    # (n_strikes, n_quad)
-        P.append(0.5 + (integ * wq[None, :]).sum(axis=1) / np.pi)
+        a = kappa * theta
+
+        d = np.sqrt(
+            (rho * xi * iu - b) ** 2
+            - xi**2 * (2.0 * u_j * iu - u**2)
+        )
+
+        # Little Heston Trap
+        g = (b - rho * xi * iu - d) / (
+            b - rho * xi * iu + d
+        )
+
+        exp_dt = np.exp(-d * T)
+
+        C = (
+            (r - q) * iu * T
+            + a / xi**2
+            * (
+                (b - rho * xi * iu - d) * T
+                - 2.0
+                * np.log(
+                    (1.0 - g * exp_dt)
+                    / (1.0 - g)
+                )
+            )
+        )
+
+        D = (
+            (b - rho * xi * iu - d)
+            / xi**2
+            * (
+                (1.0 - exp_dt)
+                / (1.0 - g * exp_dt)
+            )
+        )
+
+        cf = np.exp(
+            C
+            + D * v0
+            + iu * np.log(S0)
+        )
+
+        integ = np.real(E * cf[None, :])
+
+        Pj = (
+            0.5
+            + (integ * wq[None, :]).sum(axis=1)
+            / np.pi
+        )
+
+        P.append(Pj)
+
     return P[0], P[1]
 
 
@@ -282,8 +325,8 @@ def calibrate_heston(quotes: List[Tuple[float, float, float]],
     p0 = np.array([x0.get("v0", 0.09), x0.get("kappa", 2.0),
                    x0.get("theta", 0.09), x0.get("xi", 0.8),
                    x0.get("rho_sv", -0.6)])
-    lb = np.array([1e-4, 0.05, 1e-4, 0.05, -0.99])
-    ub = np.array([4.0, 15.0, 4.0, 3.0, 0.50])
+    lb = np.array([1e-4, 0.10, 1e-4, 0.05, -0.99])
+    ub = np.array([0.50, 10.0, 0.50, 2.00, 0.25])
     p0 = np.clip(p0, lb + 1e-6, ub - 1e-6)
 
     def resid(p):
@@ -422,10 +465,25 @@ def _mc_run(a1: Asset, a2: Asset, rho_s: float, spec: OptionSpec,
         Zs = np.vstack([Zs_h, -Zs_h]); Zw = np.vstack([Zw_h, -Zw_h])
         Zc = Zs @ L.T
         Zv = rho * Zc + rho_c * Zw
-        vp = np.maximum(v, 0.0); sq = np.sqrt(vp)
-        prev = perf
-        perf = perf * np.exp((spec.r - q - 0.5 * vp) * dt + sq * sqdt * Zc)
-        v = v + kap * (th - vp) * dt + xi * sq * sqdt * Zv
+        vp = np.maximum(v, 0.0)
+        sq = np.sqrt(vp)
+
+        v_next = (
+        v
+        + kap * (th - vp) * dt
+        + xi * sq * sqdt * Zv
+        )
+
+        v_next = np.maximum(v_next, 0.0)
+
+        v_avg = 0.5 * (vp + v_next)
+
+        perf = perf * np.exp(
+        (spec.r - q - 0.5 * v_avg) * dt
+        + np.sqrt(v_avg) * sqdt * Zc
+        )
+
+        v = v_next
         agg = aggfun(perf)
 
         if cont_barrier:
